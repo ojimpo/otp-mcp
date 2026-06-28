@@ -1,0 +1,22 @@
+services:
+  otp-mcp:
+    build: .
+    ports:
+      - "4101:3000"
+    environment:
+      - TRANSPORT=http
+      - PORT=3000
+      # OTPのGraphQLベースURL。下のexternalネットワーク経由で arigatai-score のOTPに到達する。
+      - OTP_BASE_URL=${OTP_BASE_URL:-http://otp:8080}
+      # リモート公開する場合はBearerトークンを設定推奨。
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      - SERVICE_LABEL=${SERVICE_LABEL:-}
+    restart: unless-stopped
+
+# OTP本体は別リポジトリ arigatai-score の docker compose で動いている。
+# そのネットワークに相乗りして http://otp:8080 で到達する。
+# 別構成でOTPを動かす場合は、このnetworks定義を外して OTP_BASE_URL を到達可能なURLに設定する。
+networks:
+  default:
+    name: arigatai-score_internal
+    external: true
