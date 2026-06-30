@@ -19,9 +19,17 @@ export interface Place {
 export interface Leg {
   mode: string;
   durationSec: number;
+  startISO: string;
+  endISO: string;
   fromName: string;
   toName: string;
   route?: string;
+  /** 路線記号などの短い名前（例 "JK"）。長い名前が無いときの代替表示に使う。 */
+  routeShortName?: string;
+  /** GTFS由来の路線カラー。#なし6桁HEX（例 "2DBC8F"）。地図/タイムラインの線色に使う。 */
+  color?: string;
+  /** 路線カラー上に置く文字色。#なし6桁HEX。 */
+  textColor?: string;
 }
 
 export interface Itinerary {
@@ -95,7 +103,13 @@ export async function planJourney(from: Place, to: Place, numItineraries = 3): P
     ) {
       edges { node {
         start end
-        legs { mode duration from { name } to { name } route { shortName longName } }
+        legs {
+          mode duration
+          start { scheduledTime }
+          end { scheduledTime }
+          from { name } to { name }
+          route { shortName longName color textColor }
+        }
       } }
     }
   }`;
@@ -110,9 +124,14 @@ export async function planJourney(from: Place, to: Place, numItineraries = 3): P
     const legs: Leg[] = (node.legs ?? []).map((l: any) => ({
       mode: l.mode,
       durationSec: l.duration,
+      startISO: l.start?.scheduledTime ?? node.start,
+      endISO: l.end?.scheduledTime ?? node.end,
       fromName: normalizeName(l.from?.name ?? ""),
       toName: normalizeName(l.to?.name ?? ""),
       route: l.route ? normalizeName(l.route.longName ?? l.route.shortName ?? "") : undefined,
+      routeShortName: l.route?.shortName ? normalizeName(l.route.shortName) : undefined,
+      color: l.route?.color || undefined,
+      textColor: l.route?.textColor || undefined,
     }));
     const transfers = Math.max(0, legs.filter((l) => l.mode !== "WALK").length - 1);
     itins.push({ startISO: node.start, endISO: node.end, durationMin, transfers, legs });

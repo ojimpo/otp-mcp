@@ -42,28 +42,28 @@
 - **検証済み**: 公開URLで `tools/list`（plan_journey / suggest_stations）と `plan_journey 新宿→渋谷` が動作。精度は OTP由来で正確（例 鶴見→赤羽 43分、Yahoo乗換案内と一致）
 - **背景**: 公開の Transit API（MCP付き）は便利だが関東のJR直通系統で精度が約5倍悪く、arigatai-score では採用見送り。その「便利なMCP体験」を自前OTPの正確データで実現したのが本ツール。詳細は arigatai-score の docs/transit-api-evaluation.md
 
-## 次の作業: グラフィカル経路表示 `plan_route_map`（未実装・実現可能性は確認済み）
+## グラフィカル経路表示 `plan_route_map`（実装済み・2026-06-30）
 
-claude.aiはツールが返す**画像をインライン表示できる**ので、経路を描いた地図PNGを返すツールを足せばグラフィカル表示できる（Transit API MCPの `plan_route_map` 相当）。
+claude.aiはツールが返す**画像をインライン表示できる**ので、経路を描いたPNGを返すツール `plan_route_map` を追加した。
 
-**確認済みの事実**: OTPの planConnection は leg ごとに線形と路線カラーを返す。
-- `legGeometry { points }` … Google encoded polyline（precision 5）。例 `'yvyxEsgtsY...'`
-- `route { color textColor }` … 6桁HEX（#なし）。例 埼京線 `color=2DBC8F`
-- WALK legは route=null なので灰色で描く
+**当初はOSMタイル地図を想定していたが、最終的に「Yahoo乗換案内アプリのルート詳細」のような縦タイムライン図にした**（地理的な地図ではなく、駅・発着時刻・路線カラー・乗換を縦に並べたダイヤグラム）。地図より一目で経路がわかる、外部タイル取得が不要、という判断。
 
-**実装プラン**:
-1. 依存追加: `staticmaps`（OSMタイル上にライン/マーカーを描いてPNG出力。内部で sharp を使う）、`@mapbox/polyline`（polylineデコード）
-2. `src/otp.ts`: `planJourney` のGraphQLに `legGeometry { points }` と `route { color }` を追加し、`Leg` 型に `points?: string` / `color?: string` を持たせる（この拡張は途中まで着手して戻した。再度入れるところから）
-3. `src/map.ts` 新規: `renderRouteMap(itinerary) -> Promise<Buffer>`
-   - 各legを `polyline.decode(points)`（[lat,lon]→staticmapsは[lon,lat]順なので入れ替え）して `map.addLine`
-   - WALK=灰色破線、transit=`#${leg.color || 'デフォルト'}`、太さで区別
-   - 始点（緑）・終点（赤）・乗換点は `map.addCircle` で（staticmapsのaddMarkerはアイコン画像が要るのでcircleが楽）
-   - `await map.render(); return await map.image.buffer('image/png')`
-4. `src/index.ts`: ツール `plan_route_map`（入力は plan_journey と同じ from/to）を登録。返り値は
-   `{ content: [{ type: "image", data: <base64>, mimeType: "image/png" }, { type: "text", text: <整形済み経路> }] }`
-5. ビルド→`docker compose up -d --build`→公開URL経由で claude.ai に地図が出ることを確認
+**実装の要点**:
+- 描画は `@napi-rs/canvas`（prebuiltバイナリ。nativeビルド不要、node:22-slimで動く）。staticmaps/sharp/OSMタイルは使わない
+- `src/otp.ts`: `Leg` に leg単位の `startISO`/`endISO`、`color`/`textColor`（GTFS路線カラー、#なし6桁HEX）、`routeShortName` を追加。GraphQLに `start { scheduledTime } end { scheduledTime } route { color textColor }` を追加
+- `src/timeline.ts` 新規: `renderRouteTimeline(from, to, itinerary) -> Buffer`
+  - legから駅ノード列を組み、駅ごとに 着/発 時刻（乗換駅は2行）を表示
+  - 区間は路線カラーの縦バー＋路線名チップ（チップ背景=路線カラー、文字色=textColorか明度判定で白黒）。WALKは灰色破線＋「徒歩N分」
+  - 始点=緑、終点=赤、中間=白抜きノード
+  - 日本語フォントは `GlobalFonts.registerFromPath` で明示登録（napi-rs/canvasはfontconfigを見ない）。候補パスを自動探索＋`OTP_FONT_PATH`で上書き可
+- `src/index.ts`: ツール `plan_route_map`（入力 from/to＋任意の routeIndex）を登録。返り値は
+  `{ content: [{ type: "image", data: <base64>, mimeType: "image/png" }, { type: "text", text: <整形済み経路> }] }`
+- `Dockerfile`: runtimeステージに `fonts-noto-cjk` を apt で追加（画像の日本語描画用）
+- 動作確認CLI: `node build/index.js map 新宿 渋谷 route.png [routeIndex]`
 
-**注意点**:
-- staticmapsはOSMタイルを外部取得する。コンテナはdocker NAT経由で外に出られるので可。OSMのタイル利用ポリシーに沿って User-Agent を設定すること
-- sharp は node:22-slim でprebuiltが入る（ビルド時間・イメージサイズ増に注意）
-- まず1ルート（best=itineraries[0]）だけ描けば十分。複数表示は後回しでよい
+**検証済み（2026-06-30, ローカルCLI）**: 新宿→渋谷（JR山手線・緑チップ）、鶴見→赤羽（2回乗換・着/発時刻・京浜東北/東海道/宇都宮線の各カラー）、座標→池袋（徒歩legの灰色破線）でPNG生成を確認。日本語も正しく描画される。
+
+**残課題 / 今後**:
+- 本番反映: `docker compose up -d --build` → 公開URL経由で claude.ai にインライン表示されることを未確認（要デプロイ）。フォント入りでイメージサイズ・ビルド時間が増える点に注意
+- 複数ルートの並列表示や、運賃・番線表示は未対応（GTFSの運賃精度に不安があり今は出していない）
+- 座標入力時の端点名はOTPの "Origin"/"Destination" を解決済み地点名に置換済み

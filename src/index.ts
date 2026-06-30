@@ -12,6 +12,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { resolvePlace, suggestStations, planJourney, formatJourney, formatStations } from "./otp.js";
+import { renderRouteTimeline } from "./timeline.js";
 
 const SERVICE_LABEL = process.env.SERVICE_LABEL || "self-hosted OTP (Kanto rail/subway)";
 // 複数インスタンスを区別したい場合にツール名へ付けるサフィックス。
@@ -51,6 +52,30 @@ function createServer(): Server {
         },
       },
       {
+        name: toolName("plan_route_map"),
+        description:
+          `Plan a rail/subway journey and return it as a Yahoo!乗換案内-style vertical timeline diagram (PNG image), ` +
+          `plus the same itinerary as text. ` +
+          `The image shows stations, departure/arrival times, line names in their official colors, and transfer points stacked vertically. ` +
+          `'from' and 'to' are each a station name (e.g. "新宿") or a "lat,lon" coordinate. ` +
+          `By default renders the best (fastest) itinerary; use 'routeIndex' to pick another. ` +
+          `Use this when a visual route is helpful; use plan_journey for plain text.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            from: { type: "string", description: 'Origin: a station name or a "lat,lon" coordinate.' },
+            to: { type: "string", description: 'Destination: a station name or a "lat,lon" coordinate.' },
+            routeIndex: {
+              type: "number",
+              minimum: 0,
+              maximum: 5,
+              description: "Which itinerary to draw, 0 = best/fastest (default 0).",
+            },
+          },
+          required: ["from", "to"],
+        },
+      },
+      {
         name: toolName("suggest_stations"),
         description:
           `Autocomplete station names against the self-hosted OpenTripPlanner instance (${SERVICE_LABEL}). ` +
@@ -77,6 +102,23 @@ function createServer(): Server {
           const n = args?.numItineraries ? Number(args.numItineraries) : 3;
           const itins = await planJourney(from, to, n);
           return { content: [{ type: "text", text: formatJourney(from, to, itins) }] };
+        }
+        case "plan_route_map": {
+          const from = await resolvePlace(String(args?.from ?? ""));
+          const to = await resolvePlace(String(args?.to ?? ""));
+          const idx = args?.routeIndex ? Math.max(0, Number(args.routeIndex)) : 0;
+          const itins = await planJourney(from, to, idx + 1);
+          if (!itins.length) {
+            return { content: [{ type: "text", text: formatJourney(from, to, itins) }] };
+          }
+          const it = itins[Math.min(idx, itins.length - 1)];
+          const png = renderRouteTimeline(from, to, it);
+          return {
+            content: [
+              { type: "image", data: png.toString("base64"), mimeType: "image/png" },
+              { type: "text", text: formatJourney(from, to, [it]) },
+            ],
+          };
         }
         case "suggest_stations": {
           const stations = await suggestStations(String(args?.q ?? ""), args?.limit ? Number(args.limit) : 10);
