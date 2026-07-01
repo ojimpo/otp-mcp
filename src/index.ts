@@ -10,9 +10,19 @@ if (_firstArg) {
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { resolvePlace, suggestStations, planJourney, formatJourney, formatStations } from "./otp.js";
-import { renderRouteTimeline } from "./timeline.js";
+import { buildRouteMapData } from "./routemap.js";
+import { ROUTE_MAP_HTML } from "./ui/routeMapHtml.js";
+
+// MCP Apps（MCP-UI）: plan_route_map の結果をclaude.aiがインライン描画するHTMLアプリ。
+const ROUTE_MAP_URI = "ui://otp/route-map";
+const UI_MIME = "text/html;profile=mcp-app";
 
 const SERVICE_LABEL = process.env.SERVICE_LABEL || "self-hosted OTP (Kanto rail/subway)";
 // 複数インスタンスを区別したい場合にツール名へ付けるサフィックス。
@@ -24,8 +34,29 @@ const baseName = (n: string) =>
 function createServer(): Server {
   const server = new Server(
     { name: "otp-mcp", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    {
+      capabilities: {
+        tools: {},
+        resources: {},
+        // MCP Apps拡張の宣言（Transit乗換案内と同じ）。claude.aiがこれを見て
+        // _meta.ui.resourceUri のHTMLアプリをインライン表示する。
+        extensions: { "io.modelcontextprotocol/ui": { mimeTypes: [UI_MIME] } },
+      } as Record<string, unknown>,
+    },
   );
+
+  // UIリソース（plan_route_map の描画アプリ）を公開する。
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
+      { uri: ROUTE_MAP_URI, name: "route_map", mimeType: UI_MIME, description: "Route timeline view (MCP App)." },
+    ],
+  }));
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    if (request.params.uri === ROUTE_MAP_URI) {
+      return { contents: [{ uri: ROUTE_MAP_URI, mimeType: UI_MIME, text: ROUTE_MAP_HTML }] };
+    }
+    throw new Error(`Unknown resource: ${request.params.uri}`);
+  });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -54,12 +85,12 @@ function createServer(): Server {
       {
         name: toolName("plan_route_map"),
         description:
-          `Plan a rail/subway journey and return it as a Yahoo!乗換案内-style vertical timeline diagram (PNG image), ` +
-          `plus the same itinerary as text. ` +
-          `The image shows stations, departure/arrival times, line names in their official colors, and transfer points stacked vertically. ` +
+          `Plan a rail/subway journey and render it as a Yahoo!乗換案内-style vertical timeline (an inline interactive view on claude.ai). ` +
+          `The view shows stations, departure/arrival times, line names in their official colors, and transfer points stacked vertically; ` +
+          `the same itinerary is also returned as text. ` +
           `'from' and 'to' are each a station name (e.g. "新宿") or a "lat,lon" coordinate. ` +
-          `By default renders the best (fastest) itinerary; use 'routeIndex' to pick another. ` +
-          `Use this when a visual route is helpful; use plan_journey for plain text.`,
+          `By default shows the best (fastest) itinerary; use 'routeIndex' to pick another. ` +
+          `Prefer this over plan_journey when a visual route is helpful.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -69,11 +100,13 @@ function createServer(): Server {
               type: "number",
               minimum: 0,
               maximum: 5,
-              description: "Which itinerary to draw, 0 = best/fastest (default 0).",
+              description: "Which itinerary to show, 0 = best/fastest (default 0).",
             },
           },
           required: ["from", "to"],
         },
+        // MCP Apps: この結果を ui://otp/route-map のHTMLアプリで描画する。
+        _meta: { ui: { resourceUri: ROUTE_MAP_URI } },
       },
       {
         name: toolName("suggest_stations"),
@@ -112,12 +145,13 @@ function createServer(): Server {
             return { content: [{ type: "text", text: formatJourney(from, to, itins) }] };
           }
           const it = itins[Math.min(idx, itins.length - 1)];
-          const png = renderRouteTimeline(from, to, it);
+          const data = buildRouteMapData(from, to, it);
+          // structuredContent をUIアプリ（ui://otp/route-map）が受け取って描画する。
+          // text は非UIクライアント（Claude Code等）とモデル用のフォールバック。
           return {
-            content: [
-              { type: "image", data: png.toString("base64"), mimeType: "image/png" },
-              { type: "text", text: formatJourney(from, to, [it]) },
-            ],
+            content: [{ type: "text", text: formatJourney(from, to, [it]) }],
+            structuredContent: data,
+            _meta: { ui: { resourceUri: ROUTE_MAP_URI } },
           };
         }
         case "suggest_stations": {

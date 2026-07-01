@@ -1,18 +1,21 @@
 // CLIモード: MCPを介さず直接OTPに問い合わせる。動作確認・デバッグ用。
 //   node build/index.js plan 新宿 渋谷
 //   node build/index.js suggest 新宿
-//   node build/index.js map 新宿 渋谷 route.png
+//   node build/index.js map 新宿 渋谷 route.html   （MCP Appを単体プレビューできるHTMLを出力）
 import { writeFileSync } from "node:fs";
 import { resolvePlace, suggestStations, planJourney, formatJourney, formatStations } from "./otp.js";
-import { renderRouteTimeline } from "./timeline.js";
+import { buildRouteMapData } from "./routemap.js";
+import { ROUTE_MAP_HTML } from "./ui/routeMapHtml.js";
 
 export async function runCli(args: string[]): Promise<void> {
   const [cmd, ...rest] = args;
   if (cmd === "map") {
-    // node build/index.js map 新宿 渋谷 [out.png] [routeIndex]
+    // node build/index.js map 新宿 渋谷 [out.html] [routeIndex]
+    // MCP Appのビュー（ui://otp/route-map）に structuredContent を流し込んだ、
+    // ブラウザで直接開けるHTMLを書き出す（見た目の確認用）。
     const [from, to, out, idxStr] = rest;
     if (!from || !to) {
-      console.error("usage: otp-mcp map <from> <to> [out.png] [routeIndex]");
+      console.error("usage: otp-mcp map <from> <to> [out.html] [routeIndex]");
       process.exit(1);
     }
     const f = await resolvePlace(from);
@@ -24,11 +27,16 @@ export async function runCli(args: string[]): Promise<void> {
       process.exit(1);
     }
     const it = itins[Math.min(idx, itins.length - 1)];
-    const png = renderRouteTimeline(f, t, it);
-    const path = out || "route.png";
-    writeFileSync(path, png);
+    const data = buildRouteMapData(f, t, it);
+    // window.__ROUTE__ に注入 → アプリ側が起動時に描画する。
+    const html = ROUTE_MAP_HTML.replace(
+      "<script>",
+      `<script>window.__ROUTE__ = ${JSON.stringify(data)};</script>\n<script>`,
+    );
+    const path = out || "route.html";
+    writeFileSync(path, html);
     console.log(formatJourney(f, t, [it]));
-    console.log(`\n→ 画像を書き出しました: ${path} (${png.length} bytes)`);
+    console.log(`\n→ プレビューHTMLを書き出しました: ${path}`);
   } else if (cmd === "plan") {
     const [from, to, n] = rest;
     if (!from || !to) {

@@ -42,28 +42,32 @@
 - **検証済み**: 公開URLで `tools/list`（plan_journey / suggest_stations）と `plan_journey 新宿→渋谷` が動作。精度は OTP由来で正確（例 鶴見→赤羽 43分、Yahoo乗換案内と一致）
 - **背景**: 公開の Transit API（MCP付き）は便利だが関東のJR直通系統で精度が約5倍悪く、arigatai-score では採用見送り。その「便利なMCP体験」を自前OTPの正確データで実現したのが本ツール。詳細は arigatai-score の docs/transit-api-evaluation.md
 
-## グラフィカル経路表示 `plan_route_map`（実装済み・2026-06-30）
+## グラフィカル経路表示 `plan_route_map`（MCP Apps方式・2026-07-01 作り替え）
 
-claude.aiはツールが返す**画像をインライン表示できる**ので、経路を描いたPNGを返すツール `plan_route_map` を追加した。
+「Yahoo乗換案内アプリのルート詳細」風の縦タイムライン（駅・発着時刻・路線カラー・乗換を縦に並べたダイヤグラム）を claude.ai にインライン表示するツール。
 
-**当初はOSMタイル地図を想定していたが、最終的に「Yahoo乗換案内アプリのルート詳細」のような縦タイムライン図にした**（地理的な地図ではなく、駅・発着時刻・路線カラー・乗換を縦に並べたダイヤグラム）。地図より一目で経路がわかる、外部タイル取得が不要、という判断。
+**重要な経緯（回り道の記録）**:
+1. 最初は `@napi-rs/canvas` で**PNG画像**を生成し image content（`{type:"image"}`）で返した。CLIでは正しく描けたが、**claude.aiのチャットには画像が表示されなかった**（テキストのみ表示）。
+2. 調査の結果、**claude.aiのリモートコネクタは tool result の image content block をインライン表示しない**（既知の制限。Claude自身は画像を分析できるがUIには出ない）。
+3. だが公開の **Transit乗換案内 MCP（`https://api.transit.ls8h.com/mcp`）は claude.ai で経路図を出せている**。その実レスポンスを直接叩いて調べたところ、正体は **MCP Apps（MCP-UI）拡張**だった:
+   - initializeで `capabilities.extensions["io.modelcontextprotocol/ui"] = { mimeTypes:["text/html;profile=mcp-app"] }` を宣言
+   - `ui://.../route-map` という **HTMLアプリ**を resource として公開
+   - ツール定義に `_meta.ui.resourceUri` を付け、ツールは **structuredContent** を返す
+   - claude.aiがそのHTMLアプリをiframeでインライン表示し、`postMessage` で structuredContent を渡す → アプリがSVGで描画
+4. → **PNG方式を捨て、Transit APIと同じMCP Apps方式に作り替えた**（この方式ならHTML内でSVGが描け、ホスト提供フォントで日本語も出る＝フォント同梱不要）。
 
-**実装の要点**:
-- 描画は `@napi-rs/canvas`（prebuiltバイナリ。nativeビルド不要、node:22-slimで動く）。staticmaps/sharp/OSMタイルは使わない
-- `src/otp.ts`: `Leg` に leg単位の `startISO`/`endISO`、`color`/`textColor`（GTFS路線カラー、#なし6桁HEX）、`routeShortName` を追加。GraphQLに `start { scheduledTime } end { scheduledTime } route { color textColor }` を追加
-- `src/timeline.ts` 新規: `renderRouteTimeline(from, to, itinerary) -> Buffer`
-  - legから駅ノード列を組み、駅ごとに 着/発 時刻（乗換駅は2行）を表示
-  - 区間は路線カラーの縦バー＋路線名チップ（チップ背景=路線カラー、文字色=textColorか明度判定で白黒）。WALKは灰色破線＋「徒歩N分」
-  - 始点=緑、終点=赤、中間=白抜きノード
-  - 日本語フォントは `GlobalFonts.registerFromPath` で明示登録（napi-rs/canvasはfontconfigを見ない）。候補パスを自動探索＋`OTP_FONT_PATH`で上書き可
-- `src/index.ts`: ツール `plan_route_map`（入力 from/to＋任意の routeIndex）を登録。返り値は
-  `{ content: [{ type: "image", data: <base64>, mimeType: "image/png" }, { type: "text", text: <整形済み経路> }] }`
-- `Dockerfile`: runtimeステージに `fonts-noto-cjk` を apt で追加（画像の日本語描画用）
-- 動作確認CLI: `node build/index.js map 新宿 渋谷 route.png [routeIndex]`
+**現在の実装**:
+- `src/otp.ts`: `Leg` に leg単位の `startISO`/`endISO`、`color`/`textColor`（GTFS路線カラー、#なし6桁HEX）、`routeShortName`。GraphQLに `start { scheduledTime } end { scheduledTime } route { color textColor }` を追加
+- `src/routemap.ts` 新規: `buildRouteMapData(from, to, itinerary) -> RouteMapData`。経路を描画用の構造化データ（title/subtitle/stops[]/segments[]）に整形。時刻はISO文字列の壁掛け時刻を直接取り出す（実行環境TZ非依存）
+- `src/ui/routeMapHtml.ts` 新規: MCP Appのビュー（HTML文字列 `ROUTE_MAP_HTML`）。MCP-UIの postMessageブリッジ（`ui/initialize`→`initialized`、`ui/notifications/tool-result` 受信、host-context/テーマ適用、size通知、ping/teardown応答）を実装し、structuredContentから**SVGで縦タイムライン**を描く。ホストのCSS変数/フォントを使うのでダークモード対応・日本語フォント同梱不要。**注意: 路線名チップ幅は `getBBox` で測るので、SVGをDOMに追加してから描画すること**（未追加だとBBox=0でチップが潰れる。ここで一度ハマった）
+- `src/index.ts`: `io.modelcontextprotocol/ui` 拡張を宣言＋ `resources/list`・`resources/read` で `ui://otp/route-map`（=ROUTE_MAP_HTML, mime `text/html;profile=mcp-app`）を公開。`plan_route_map` ツール定義に `_meta.ui.resourceUri` を付与。ツールは `{ content:[text], structuredContent, _meta }` を返す（textは非UIクライアント/モデル用フォールバック）
+- 動作確認CLI: `node build/index.js map 新宿 渋谷 route.html [routeIndex]` → window.__ROUTE__ を注入した単体プレビューHTMLを出力（ブラウザで開ける）
 
-**検証済み（2026-06-30, ローカルCLI）**: 新宿→渋谷（JR山手線・緑チップ）、鶴見→赤羽（2回乗換・着/発時刻・京浜東北/東海道/宇都宮線の各カラー）、座標→池袋（徒歩legの灰色破線）でPNG生成を確認。日本語も正しく描画される。
+**やめたもの**: `@napi-rs/canvas` 依存、`fonts-noto-cjk`（Dockerfile）、`src/timeline.ts`（PNG生成）。MCP Apps方式では不要。
 
-**残課題 / 今後**:
-- 本番反映: `docker compose up -d --build` → 公開URL経由で claude.ai にインライン表示されることを未確認（要デプロイ）。フォント入りでイメージサイズ・ビルド時間が増える点に注意
-- 複数ルートの並列表示や、運賃・番線表示は未対応（GTFSの運賃精度に不安があり今は出していない）
-- 座標入力時の端点名はOTPの "Origin"/"Destination" を解決済み地点名に置換済み
+**検証済み（2026-07-01）**:
+- ローカル起動＋curlでMCP契約を確認: initializeに拡張が出る / `plan_route_map` に `_meta.ui.resourceUri` / resources/read でHTML取得 / tools/call が structuredContent を返す（SDK ^1.29 は `_meta`・`structuredContent` を素通しする）
+- ヘッドレスChromeで実レンダリング確認（座標→鶴見→川崎→東京→赤羽・徒歩leg＋2回乗換）: 路線カラーのバー＆チップ、着/発2段、始点緑/終点赤、日本語表示すべてOK
+- **未検証**: claude.ai実機でのインライン表示（要デプロイ＆コネクタ再接続）。深夜帯はOTPが経路なしを返す点に注意
+
+**今後**: 複数ルート切替、運賃・番線表示（GTFS運賃精度に不安があり保留）、地図タイル表示（Transit APIは地理院タイルも併用している）。
